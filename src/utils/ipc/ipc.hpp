@@ -425,6 +425,7 @@ class Server {
     }
 
     if (worker_thread_.joinable()) {
+      CancelSynchronousIo(worker_thread_.native_handle());
       worker_thread_.join();
     }
 
