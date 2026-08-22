@@ -1,0 +1,28 @@
+{
+  "$schema": "https://clshortfuse.github.io/renodx/renodx-metadata-schema.json",
+  "id": "thelastofuspart1",
+  "title": "The Last of Us Part I",
+  "summary": "Experimental native-HDR PsychoV, RenoDRT, and NeuTwo tone mapping for The Last of Us Part I.",
+  "status": "experimental",
+  "tags": [
+    "HDR",
+    "PsychoV",
+    "RenoDRT",
+    "NeuTwo"
+  ],
+  "notes": [
+    "Requires Windows HDR and the in-game HDR output option.",
+    "Initial shader and descriptor-layout support targets game version 1.1.5.0.",
+    "Version 1.1.4.0 and other builds require separate capture validation."
+  ],
+  "deploy": {
+    "game_exe": "tlou-i.exe",
+    "process_name": "tlou-i",
+    "api": "d3d12",
+    "steam_appid": 1888930,
+    "architecture": [
+      "x64"
+    ],
+    "platform": "steam"
+  }
+}
