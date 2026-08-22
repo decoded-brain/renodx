@@ -19,27 +19,23 @@ static const float TLOU_FIXED_REFERENCE_NITS = 203.f;
 static const float TLOU_NATIVE_ENCODER_REFERENCE_NITS = 300.f;
 static const float TLOU_REFERENCE_GRAY = 0.18f;
 
-// V(x) = (d*x + e) / (x*x + a*x + b) + c
-static const float TLOU_NATIVE_CURVE_A = 0.90909094f;
-static const float TLOU_NATIVE_CURVE_B = 0.13636364f;
-static const float TLOU_NATIVE_CURVE_C = 0.96666670f;
-static const float TLOU_NATIVE_CURVE_D = -0.75454545f;
-static const float TLOU_NATIVE_CURVE_E = -0.13181819f;
-
 struct TLOUToneMapBridgeState {
   float enabled;
-  float3 neutral_sdr_bt709;
+  float3 lut_target_native_bt709;
   float3 adaptive_state_lms;
   float max_channel_scale;
   float gamut_compression_scale;
 };
 
 float TLOUNativeCurve(float x) {
+  x = max(x, 0.f);
+  if (TLOU_NATIVE_CURVE_ENABLED < 0.5f) return x;
   float denominator = x * x + TLOU_NATIVE_CURVE_A * x + TLOU_NATIVE_CURVE_B;
   return (TLOU_NATIVE_CURVE_D * x + TLOU_NATIVE_CURVE_E) / denominator + TLOU_NATIVE_CURVE_C;
 }
 
 float TLOUNativeCurveDerivative(float x) {
+  if (TLOU_NATIVE_CURVE_ENABLED < 0.5f) return 1.f;
   float denominator = x * x + TLOU_NATIVE_CURVE_A * x + TLOU_NATIVE_CURVE_B;
   float numerator = TLOU_NATIVE_CURVE_D * x + TLOU_NATIVE_CURVE_E;
   return (TLOU_NATIVE_CURVE_D * denominator
@@ -47,8 +43,19 @@ float TLOUNativeCurveDerivative(float x) {
          / (denominator * denominator);
 }
 
+float TLOULutInputMax() {
+  float compression = max(TLOU_LUT_COMPRESSION, 1e-6f);
+  return pow(2.f, 4.f / 3.f) * pow(compression, 1.f / 3.f);
+}
+
+float TLOULutOutputCeiling() {
+  return clamp(TLOUNativeCurve(TLOULutInputMax()), 1e-4f, 1.f - 1e-4f);
+}
+
 float TLOUNativeCurveInverse(float y) {
-  y = clamp(y, 0.f, TLOU_NATIVE_CURVE_C - 1e-6f);
+  if (TLOU_NATIVE_CURVE_ENABLED < 0.5f) return max(y, 0.f);
+  float minimum = max(TLOUNativeCurve(0.f), 0.f);
+  y = clamp(y, minimum, TLOULutOutputCeiling() - 1e-6f);
   float k = y - TLOU_NATIVE_CURVE_C;
   float quadratic_b = k * TLOU_NATIVE_CURVE_A - TLOU_NATIVE_CURVE_D;
   float quadratic_c = k * TLOU_NATIVE_CURVE_B - TLOU_NATIVE_CURVE_E;
@@ -64,9 +71,9 @@ float3 TLOUSanitize(float3 color) {
   return all(isfinite(color)) ? max(color, 0.f) : 0.f.xxx;
 }
 
-float3 TLOULimitPeak(float3 color) {
+float3 TLOULimitPeak(float3 color, float peak_value) {
   color = TLOUSanitize(color);
-  float peak_value = max(RENODX_PEAK_WHITE_NITS / max(RENODX_DIFFUSE_WHITE_NITS, 1e-6f), 1e-6f);
+  peak_value = max(peak_value, 1e-6f);
   float max_channel = renodx::math::Max(color);
   if (max_channel > peak_value) color *= peak_value / max_channel;
   return color;
@@ -75,8 +82,11 @@ float3 TLOULimitPeak(float3 color) {
 TLOUToneMapBridgeState TLOUCreateToneMapBridgeState() {
   TLOUToneMapBridgeState state;
   state.enabled = 0.f;
-  state.neutral_sdr_bt709 = 0.f.xxx;
-  state.adaptive_state_lms = renodx::color::lms::from::BT709(TLOU_REFERENCE_GRAY.xxx);
+  state.lut_target_native_bt709 = 0.f.xxx;
+  float native_gray = TLOU_REFERENCE_GRAY
+                      * RENODX_DIFFUSE_WHITE_NITS
+                      / TLOU_NATIVE_ENCODER_REFERENCE_NITS;
+  state.adaptive_state_lms = renodx::color::lms::from::BT709(native_gray.xxx);
   state.max_channel_scale = 1.f;
   state.gamut_compression_scale = 1.f;
   return state;
@@ -136,6 +146,24 @@ float3 TLOUMapNeutwo(
   return color * mapped_max / max_channel;
 }
 #endif
+
+float3 TLOUMatchVanillaDiffuse(
+    float3 exposed_scene_bt709,
+    float3 tone_mapped_bt709,
+    float reference_input,
+    float reference_output) {
+  float scene_max = renodx::math::Max(max(exposed_scene_bt709, 0.f));
+  float mapped_max = renodx::math::Max(max(tone_mapped_bt709, 0.f));
+  if (scene_max <= 0.f || mapped_max <= 0.f) return max(tone_mapped_bt709, 0.f);
+
+  float native_reference = max(TLOUNativeCurve(reference_input), 1e-6f);
+  float native_max = TLOUNativeCurve(scene_max)
+                     * reference_output
+                     / native_reference;
+  float mapper_weight = smoothstep(reference_input * 2.f, reference_input * 4.f, scene_max);
+  float target_max = lerp(native_max, mapped_max, mapper_weight);
+  return max(tone_mapped_bt709, 0.f) * target_max / mapped_max;
+}
 
 float3 TLOUPrepareToneMapLut(float3 exposed_scene_bt709, out TLOUToneMapBridgeState state) {
   state = TLOUCreateToneMapBridgeState();
@@ -224,21 +252,37 @@ float3 TLOUPrepareToneMapLut(float3 exposed_scene_bt709, out TLOUToneMapBridgeSt
         1.f, 1, 1.f);
 #endif
 
-  tone_mapped = TLOULimitPeak(tone_mapped);
-  state.gamut_compression_scale = renodx::color::gamut::ComputeGamutCompressionScaleBT709AdaptiveD65(
+  tone_mapped = TLOUMatchVanillaDiffuse(
+      exposed_scene_bt709,
       tone_mapped,
+      reference_input,
+      reference_output);
+  tone_mapped = TLOULimitPeak(tone_mapped, peak_value);
+  float native_scale = RENODX_DIFFUSE_WHITE_NITS / TLOU_NATIVE_ENCODER_REFERENCE_NITS;
+  float3 tone_mapped_native = tone_mapped * native_scale;
+  state.gamut_compression_scale = renodx::color::gamut::ComputeGamutCompressionScaleBT709AdaptiveD65(
+      tone_mapped_native,
       state.adaptive_state_lms,
       1.f);
   float3 compressed = renodx::color::gamut::GamutCompressBT709AdaptiveD65(
-      tone_mapped,
+      tone_mapped_native,
       state.adaptive_state_lms,
       state.gamut_compression_scale);
-  state.max_channel_scale = renodx::tonemap::neutwo::ComputeMaxChannelScale(compressed);
-  state.neutral_sdr_bt709 = compressed * state.max_channel_scale;
+  float max_channel = renodx::math::Max(compressed);
+  float lut_output_ceiling = TLOULutOutputCeiling();
+  state.max_channel_scale = max_channel > lut_output_ceiling
+                                ? renodx::tonemap::neutwo::ComputeMaxChannelScale(
+                                      compressed,
+                                      lut_output_ceiling)
+                                : 1.f;
+  state.lut_target_native_bt709 = compressed * state.max_channel_scale;
 
-  // Native tone mapping runs before t7. The LUT is grading-only, so feeding it
-  // V^-1 would lift midtones and flatten every custom tone mapper.
-  return state.neutral_sdr_bt709;
+  // t7 bakes the native rational curve together with grading. Remove only that
+  // curve, in the native 300-nit domain, before sampling the original LUT.
+  return float3(
+      TLOUNativeCurveInverse(state.lut_target_native_bt709.r),
+      TLOUNativeCurveInverse(state.lut_target_native_bt709.g),
+      TLOUNativeCurveInverse(state.lut_target_native_bt709.b));
 }
 
 float3 TLOUFinalizeToneMap(float3 graded_srgb, TLOUToneMapBridgeState state) {
@@ -253,11 +297,12 @@ float3 TLOUFinalizeToneMap(float3 graded_srgb, TLOUToneMapBridgeState state) {
       graded_compressed,
       state.adaptive_state_lms,
       state.gamut_compression_scale);
-  reconstructed = TLOULimitPeak(reconstructed);
+  float native_peak = RENODX_PEAK_WHITE_NITS / TLOU_NATIVE_ENCODER_REFERENCE_NITS;
+  reconstructed = TLOULimitPeak(reconstructed, native_peak);
 
-  // The native encoder decodes gamma 2.4 and treats linear 1.0 as 300 nits.
-  reconstructed *= RENODX_DIFFUSE_WHITE_NITS / TLOU_NATIVE_ENCODER_REFERENCE_NITS;
-  return TLOUSanitize(renodx::color::gamma::Encode(reconstructed, 2.4f));
+  // Preserve the game's sRGB-coded intermediate. The final native shader owns
+  // its runtime gamma exponent and PQ/BT.2020 encoding.
+  return renodx::color::srgb::EncodeSafe(TLOUSanitize(reconstructed));
 }
 
 #endif  // SRC_GAMES_THELASTOFUSPART1_COMMON_HLSLI_

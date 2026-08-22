@@ -38,6 +38,9 @@ constexpr uint32_t TLOU_LUT_SIZE = 32u;
 constexpr uint32_t TLOU_LUT_GROUP_SIZE = 4u;
 constexpr float TLOU_NATIVE_ENCODER_REFERENCE_NITS = 300.f;
 
+constexpr uint64_t C176_OFFSET = 176u;
+constexpr uint64_t C192_OFFSET = 192u;
+constexpr uint64_t C208_OFFSET = 208u;
 constexpr uint64_t C432_OFFSET = 432u;
 constexpr uint64_t C684_OFFSET = 684u;
 constexpr uint64_t C688_OFFSET = 688u;
@@ -69,8 +72,52 @@ struct NativeToneMapConstants {
   float lut_offset = 0.f;
   float post_lut_amount = 0.f;
   float lut_compression = 0.f;
+  float curve_enabled = 0.f;
+  float curve_a = 0.f;
+  float curve_b = 0.f;
+  float curve_c = 0.f;
+  float curve_d = 0.f;
+  float curve_e = 0.f;
   int output_mode = 0;
 };
+
+float EvaluateNativeCurve(float x, const NativeToneMapConstants& constants) {
+  if (constants.curve_enabled < 0.5f) return x;
+  const float denominator = x * x + constants.curve_a * x + constants.curve_b;
+  return (constants.curve_d * x + constants.curve_e) / denominator
+         + constants.curve_c;
+}
+
+float EvaluateNativeCurveDerivative(
+    float x,
+    const NativeToneMapConstants& constants) {
+  if (constants.curve_enabled < 0.5f) return 1.f;
+  const float denominator = x * x + constants.curve_a * x + constants.curve_b;
+  const float numerator = constants.curve_d * x + constants.curve_e;
+  return (constants.curve_d * denominator
+          - numerator * (2.f * x + constants.curve_a))
+         / (denominator * denominator);
+}
+
+bool ValidateNativeCurve(const NativeToneMapConstants& constants) {
+  if (constants.curve_enabled < 0.5f) return true;
+  const float lut_input_max = std::pow(2.f, 4.f / 3.f)
+                              * std::pow(constants.lut_compression, 1.f / 3.f);
+  const std::array<float, 4> samples = {0.f, 0.18f, 1.f, lut_input_max};
+  for (const float x : samples) {
+    const float denominator = x * x + constants.curve_a * x + constants.curve_b;
+    const float value = EvaluateNativeCurve(x, constants);
+    const float derivative = EvaluateNativeCurveDerivative(x, constants);
+    if (!std::isfinite(denominator)
+        || denominator <= 1e-6f
+        || !std::isfinite(value)
+        || !std::isfinite(derivative)
+        || derivative <= 0.f) {
+      return false;
+    }
+  }
+  return EvaluateNativeCurve(lut_input_max, constants) > 1e-4f;
+}
 
 struct PreviousComputeState {
   reshade::api::pipeline_stage pipeline_stages =
@@ -91,6 +138,12 @@ struct LutDirtyKey {
   float lut_offset = 0.f;
   float lut_compression = 0.f;
   float post_lut_amount = 0.f;
+  float native_curve_enabled = 0.f;
+  float native_curve_a = 0.f;
+  float native_curve_b = 0.f;
+  float native_curve_c = 0.f;
+  float native_curve_d = 0.f;
+  float native_curve_e = 0.f;
   uint64_t t7_view = 0u;
   uint64_t t7_resource = 0u;
   uint64_t t7_generation = 0u;
@@ -247,6 +300,14 @@ bool MapNativeToneMapConstants(
   }
 
   const auto* bytes = static_cast<const std::byte*>(*mapped_out);
+  std::memcpy(&constants.curve_a, bytes + C176_OFFSET, sizeof(float));
+  std::memcpy(&constants.curve_b, bytes + C176_OFFSET + sizeof(float), sizeof(float));
+  std::memcpy(&constants.curve_c, bytes + C192_OFFSET, sizeof(float));
+  std::memcpy(&constants.curve_d, bytes + C192_OFFSET + sizeof(float), sizeof(float));
+  std::memcpy(&constants.curve_e, bytes + C192_OFFSET + sizeof(float) * 2u, sizeof(float));
+  float curve_flag = 0.f;
+  std::memcpy(&curve_flag, bytes + C208_OFFSET, sizeof(float));
+  constants.curve_enabled = curve_flag == 0.f ? 0.f : 1.f;
   std::memcpy(&constants.lut_enabled, bytes + C432_OFFSET, sizeof(float));
   std::memcpy(&constants.lut_scale, bytes + C432_OFFSET + sizeof(float), sizeof(float));
   std::memcpy(&constants.lut_offset, bytes + C432_OFFSET + sizeof(float) * 2u, sizeof(float));
@@ -254,13 +315,21 @@ bool MapNativeToneMapConstants(
   std::memcpy(&constants.lut_compression, bytes + C688_OFFSET, sizeof(float));
   std::memcpy(&constants.output_mode, bytes + C692_OFFSET, sizeof(int));
 
-  const bool valid = std::isfinite(constants.lut_enabled)
+  const bool valid = std::isfinite(curve_flag)
+                     && std::isfinite(constants.lut_enabled)
                      && std::isfinite(constants.lut_scale)
                      && std::isfinite(constants.lut_offset)
                      && std::isfinite(constants.post_lut_amount)
                      && std::isfinite(constants.lut_compression)
+                     && std::isfinite(constants.curve_enabled)
+                     && std::isfinite(constants.curve_a)
+                     && std::isfinite(constants.curve_b)
+                     && std::isfinite(constants.curve_c)
+                     && std::isfinite(constants.curve_d)
+                     && std::isfinite(constants.curve_e)
                      && constants.lut_scale > 0.f
-                     && constants.lut_compression > 0.f;
+                     && constants.lut_compression > 0.f
+                     && ValidateNativeCurve(constants);
   if (!valid) {
     device->unmap_buffer_region(range.buffer);
     *mapped_out = nullptr;
@@ -582,6 +651,12 @@ bool OnToneMapDispatch(reshade::api::command_list* cmd_list) {
   lut_constants.lut_offset = native.lut_offset;
   lut_constants.lut_compression = native.lut_compression;
   lut_constants.post_lut_amount = native.post_lut_amount;
+  lut_constants.native_curve_enabled = native.curve_enabled;
+  lut_constants.native_curve_a = native.curve_a;
+  lut_constants.native_curve_b = native.curve_b;
+  lut_constants.native_curve_c = native.curve_c;
+  lut_constants.native_curve_d = native.curve_d;
+  lut_constants.native_curve_e = native.curve_e;
 
   const LutDirtyKey current_key = {
       .tone_map_type = tone_map_type,
@@ -594,6 +669,12 @@ bool OnToneMapDispatch(reshade::api::command_list* cmd_list) {
       .lut_offset = native.lut_offset,
       .lut_compression = native.lut_compression,
       .post_lut_amount = native.post_lut_amount,
+      .native_curve_enabled = native.curve_enabled,
+      .native_curve_a = native.curve_a,
+      .native_curve_b = native.curve_b,
+      .native_curve_c = native.curve_c,
+      .native_curve_d = native.curve_d,
+      .native_curve_e = native.curve_e,
       .t7_view = bindings->compute_t7.view.handle,
       .t7_resource = bindings->compute_t7.resource.handle,
       .t7_generation = bindings->compute_t7.generation,

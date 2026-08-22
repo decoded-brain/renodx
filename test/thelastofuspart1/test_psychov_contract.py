@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, getcontext
-from math import isfinite
+from math import isfinite, sqrt
 from pathlib import Path
 import re
 
@@ -45,37 +45,64 @@ def constant(name: str) -> float:
     return float(match.group(1))
 
 
-A = constant("TLOU_NATIVE_CURVE_A")
-B = constant("TLOU_NATIVE_CURVE_B")
-C = constant("TLOU_NATIVE_CURVE_C")
-D = constant("TLOU_NATIVE_CURVE_D")
-E = constant("TLOU_NATIVE_CURVE_E")
 FIXED_REFERENCE_NITS = constant("TLOU_FIXED_REFERENCE_NITS")
 ENCODER_REFERENCE_NITS = constant("TLOU_NATIVE_ENCODER_REFERENCE_NITS")
 REFERENCE_GRAY = constant("TLOU_REFERENCE_GRAY")
 
 # HDR mode 3 and SDR mode 0 captures used the same neutral coefficients.
 CAPTURED_CURVES = {
-    "hdr_mode_3": (A, B, C, D, E),
-    "sdr_mode_0": (A, B, C, D, E),
+    "hdr_mode_3": (0.90909094, 0.13636364, 0.96666670, -0.75454545, -0.13181819),
+    "sdr_mode_0": (0.90909094, 0.13636364, 0.96666670, -0.75454545, -0.13181819),
 }
 
 
-def native_curve(x: float, params: tuple[float, ...] = CAPTURED_CURVES["hdr_mode_3"]) -> float:
+def native_curve(
+    x: float,
+    params: tuple[float, ...] = CAPTURED_CURVES["hdr_mode_3"],
+    enabled: bool = True,
+) -> float:
+    if not enabled:
+        return max(x, 0.0)
     a, b, c, d, e = params
     return (d * x + e) / (x * x + a * x + b) + c
 
 
-def native_derivative(x: float, params: tuple[float, ...] = CAPTURED_CURVES["hdr_mode_3"]) -> float:
+def native_derivative(
+    x: float,
+    params: tuple[float, ...] = CAPTURED_CURVES["hdr_mode_3"],
+    enabled: bool = True,
+) -> float:
+    if not enabled:
+        return 1.0
     a, b, _, d, e = params
     denominator = x * x + a * x + b
     numerator = d * x + e
     return (d * denominator - numerator * (2 * x + a)) / (denominator * denominator)
 
 
-def native_inverse(y: float, params: tuple[float, ...] = CAPTURED_CURVES["hdr_mode_3"]) -> float:
+def lut_input_max(compression: float) -> float:
+    return 2.0 ** (4.0 / 3.0) * compression ** (1.0 / 3.0)
+
+
+def lut_output_ceiling(
+    compression: float,
+    params: tuple[float, ...] = CAPTURED_CURVES["hdr_mode_3"],
+    enabled: bool = True,
+) -> float:
+    return min(max(native_curve(lut_input_max(compression), params, enabled), 1e-4), 1.0 - 1e-4)
+
+
+def native_inverse(
+    y: float,
+    params: tuple[float, ...] = CAPTURED_CURVES["hdr_mode_3"],
+    enabled: bool = True,
+    compression: float = 1.25,
+) -> float:
+    if not enabled:
+        return max(y, 0.0)
     a, b, c, d, e = params
-    y = min(max(y, 0.0), c - 1e-6)
+    minimum = max(native_curve(0.0, params), 0.0)
+    y = min(max(y, minimum), lut_output_ceiling(compression, params) - 1e-6)
     k = y - c
     quadratic_b = k * a - d
     quadratic_c = k * b - e
@@ -119,8 +146,39 @@ def limit_peak(rgb: tuple[float, float, float], peak: float) -> tuple[float, flo
     return tuple(max(0.0, value) * scale for value in rgb)
 
 
-def native_handoff(value: float, game_nits: float) -> float:
+def native_domain(value: float, game_nits: float) -> float:
     return value * game_nits / ENCODER_REFERENCE_NITS
+
+
+def conditional_neutwo_scale(value: float, ceiling: float) -> float:
+    if value <= ceiling:
+        return 1.0
+    return ceiling / sqrt(value * value + ceiling * ceiling)
+
+
+def srgb_decode(value: float) -> float:
+    return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+
+def srgb_encode(value: float) -> float:
+    value = max(value, 0.0)
+    return value * 12.92 if value <= 0.0031308 else 1.055 * value ** (1.0 / 2.4) - 0.055
+
+
+def match_vanilla_diffuse(
+    scene: float,
+    mapped: float,
+    reference_input: float,
+    reference_output: float,
+) -> float:
+    if scene <= 0.0 or mapped <= 0.0:
+        return max(mapped, 0.0)
+    edge0 = reference_input * 2.0
+    edge1 = reference_input * 4.0
+    t = min(max((scene - edge0) / (edge1 - edge0), 0.0), 1.0)
+    weight = t * t * (3.0 - 2.0 * t)
+    native = native_curve(scene) * reference_output / native_curve(reference_input)
+    return native * (1.0 - weight) + mapped * weight
 
 
 def compress_lut_srgb(value: float, compression: float) -> float:
@@ -150,11 +208,16 @@ def neutwo_anchor(x: float, peak: float, clip: float, gray_in: float, gray_out: 
 
 def test_curve_inverse_and_derivative() -> None:
     for params in CAPTURED_CURVES.values():
-        for x in (1e-6, 1e-4, 0.001, 0.01, 0.05, 0.13243948, 0.18, 0.5, 1.0, 4.0, 16.0, 64.0):
+        maximum = lut_input_max(1.25) * 0.999
+        for x in (1e-6, 1e-4, 0.001, 0.01, 0.05, 0.13243948, 0.18, 0.5, 1.0, maximum):
             y = native_curve(x, params)
             assert abs(native_inverse(y, params) - numerical_inverse(y, params)) <= 2e-6 * max(1.0, x)
             reference = numerical_derivative(x, params)
             assert abs(native_derivative(x, params) - reference) <= 2e-6 * max(1.0, abs(reference))
+    for value in (0.0, 0.18, 1.0, 4.0):
+        assert native_curve(value, enabled=False) == value
+        assert native_inverse(value, enabled=False) == value
+        assert native_derivative(value, enabled=False) == 1.0
 
 
 def test_reference_anchor_and_log_slope() -> None:
@@ -189,17 +252,20 @@ def test_mode_neutral_glue_is_finite_and_monotonic() -> None:
     ):
         assert function in COMMON
     for values in upstream.values():
-        output = [native_handoff(limit_peak((value, value, value), peak)[0], 203.0) for value in values]
+        output = [native_domain(limit_peak((value, value, value), peak)[0], 203.0) for value in values]
         assert all(isfinite(value) and value >= 0.0 for value in output)
         assert all(left <= right for left, right in zip(output, output[1:]))
 
 
 def test_game_nits_does_not_cancel() -> None:
     value = 0.18
-    outputs = {game_nits: native_handoff(value, game_nits) for game_nits in (80.0, 203.0, 400.0)}
+    outputs = {game_nits: native_domain(value, game_nits) for game_nits in (80.0, 203.0, 400.0)}
     for game_nits, output in outputs.items():
         assert abs(output / outputs[203.0] - game_nits / 203.0) < 1e-12
     assert COMMON.count("RENODX_DIFFUSE_WHITE_NITS / TLOU_NATIVE_ENCODER_REFERENCE_NITS") == 1
+    prepare, finalize = COMMON.split("float3 TLOUFinalizeToneMap", 1)
+    assert "native_scale = RENODX_DIFFUSE_WHITE_NITS / TLOU_NATIVE_ENCODER_REFERENCE_NITS" in prepare
+    assert "RENODX_DIFFUSE_WHITE_NITS / TLOU_NATIVE_ENCODER_REFERENCE_NITS" not in finalize
 
 
 def test_uniform_peak_limit_preserves_ratios() -> None:
@@ -230,11 +296,47 @@ def test_lut_hdr_coordinate_round_trip() -> None:
             assert abs(decoded - source) <= 2e-12 * max(1.0, source)
 
 
-def test_grading_lut_does_not_reapply_native_curve() -> None:
+def test_conditional_n2_and_native_curve_removal() -> None:
+    ceiling = lut_output_ceiling(1.25)
+    for value in (0.0, ceiling * 0.25, ceiling, ceiling * 2.0, 100.0):
+        scale = conditional_neutwo_scale(value, ceiling)
+        assert scale == 1.0 if value <= ceiling else 0.0 < scale < 1.0
+        assert abs((value * scale) / scale - value) < 1e-12 if scale != 0.0 else True
+
+    game_value = REFERENCE_GRAY
+    target_native = native_domain(game_value, 203.0)
+    scene_value = native_inverse(target_native)
+    assert abs(native_curve(scene_value) - target_native) < 1e-12
+    assert "max_channel > lut_output_ceiling" in COMMON
+    assert "TLOUNativeCurveInverse(state.lut_target_native_bt709" in COMMON
+
+
+def test_native_srgb_round_trip_and_grade_domain() -> None:
+    for value in (0.0, 1e-6, 0.001, 0.01, 0.18, 0.5, 1.0):
+        assert abs(srgb_decode(srgb_encode(value)) - value) < 2e-12
+    assert srgb_encode(0.01) < 0.01 ** (1.0 / 2.4)
+    assert "renodx::color::srgb::EncodeSafe(TLOUSanitize(reconstructed))" in COMMON
+    assert "renodx::color::gamma::Encode" not in COMMON
+
+    game_value = 0.18
+    native_value = native_domain(game_value, 203.0)
+    synthetic_grade = lambda value: value**1.1
+    correct = synthetic_grade(native_value)
+    delayed_scale = native_domain(synthetic_grade(game_value), 203.0)
+    assert abs(correct - delayed_scale) > 1e-3
+
+
+def test_all_modes_match_vanilla_diffuse_before_highlights() -> None:
+    reference_input = native_inverse(REFERENCE_GRAY * FIXED_REFERENCE_NITS / ENCODER_REFERENCE_NITS)
     reference_output = REFERENCE_GRAY
-    assert native_inverse(reference_output) > reference_output
-    assert "return state.neutral_sdr_bt709;" in COMMON
-    assert "TLOUNativeCurveInverse(state.neutral_sdr_bt709" not in COMMON
+    mapper = lambda value: value * 2.0
+    for scene in (0.01, 0.05, 0.1, reference_input, reference_input * 2.0):
+        expected = native_curve(scene) * reference_output / native_curve(reference_input)
+        actual = match_vanilla_diffuse(scene, mapper(scene), reference_input, reference_output)
+        assert abs(actual - expected) < 1e-12
+    for scene in (reference_input * 4.0, 1.0, 4.0):
+        assert abs(match_vanilla_diffuse(scene, mapper(scene), reference_input, reference_output) - mapper(scene)) < 1e-12
+    assert "tone_mapped = TLOUMatchVanillaDiffuse(" in COMMON
 
 
 def test_sparse_descriptor_update_and_copy_contract() -> None:
@@ -270,7 +372,8 @@ def test_sparse_descriptor_update_and_copy_contract() -> None:
 def test_lut_dirty_key_contract() -> None:
     base = (
         1, 1000.0, 203.0, 1.0, 1.0, 1.0,
-        31.0 / 32.0, 0.5 / 32.0, 8.0, 0.0,
+        31.0 / 32.0, 0.5 / 32.0, 1.25, 0.0,
+        1.0, *CAPTURED_CURVES["hdr_mode_3"],
         0x700, 0x701, 1, 0x800, 0x801, 1,
     )
     assert base == tuple(base)
@@ -301,7 +404,17 @@ def test_requested_modes_are_game_local_and_wired() -> None:
     assert "psychov_test25_nrg.hlsli" in PSYCHOV_PATHS[25].read_text(encoding="utf-8")
     assert "config.mid_gray_value = reference_input" in COMMON
     assert "config.mid_gray_nits = reference_output * 100.f" in COMMON
-    assert "sizeof(ShaderInjectData) == 48" in SHARED
+    assert "sizeof(ShaderInjectData) == 80" in SHARED
+    for field in (
+        "native_curve_enabled",
+        "native_curve_a",
+        "native_curve_b",
+        "native_curve_c",
+        "native_curve_d",
+        "native_curve_e",
+    ):
+        assert field in SHARED
+        assert field in ADDON
     for mode, path in VARIANT_PATHS.items():
         wrapper = path.read_text(encoding="utf-8")
         assert f"#define TLOU_COMPILED_TONE_MAP_TYPE {mode}" in wrapper
@@ -330,6 +443,11 @@ def test_hdr_and_vanilla_gates_are_explicit() -> None:
     assert "RENODX_UI_MAGIC" in GUI
     assert ": 1.f;" in GUI
     assert "PatchGuiConstants" in ADDON
+    assert "ValidateNativeCurve" in ADDON
+    for offset in ("C176_OFFSET = 176u", "C192_OFFSET = 192u", "C208_OFFSET = 208u"):
+        assert offset in ADDON
+    assert "TLOU_DIAGNOSTIC" not in ADDON
+    assert "TLOU_DIAGNOSTIC" not in COMMON
 
 
 def test_lut_path_does_not_replace_the_full_resolution_shader() -> None:
@@ -368,7 +486,9 @@ def main() -> None:
         test_uniform_peak_limit_preserves_ratios,
         test_neutwo_native_anchor_is_finite_and_monotonic,
         test_lut_hdr_coordinate_round_trip,
-        test_grading_lut_does_not_reapply_native_curve,
+        test_conditional_n2_and_native_curve_removal,
+        test_native_srgb_round_trip_and_grade_domain,
+        test_all_modes_match_vanilla_diffuse_before_highlights,
         test_sparse_descriptor_update_and_copy_contract,
         test_lut_dirty_key_contract,
         test_requested_modes_are_game_local_and_wired,

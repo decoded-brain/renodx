@@ -17,10 +17,16 @@ struct ShaderInjectData {
   float lut_offset;
   float lut_compression;
   float post_lut_amount;
+  float native_curve_enabled;
+  float native_curve_a;
+  float native_curve_b;
+  float native_curve_c;
+  float native_curve_d;
+  float native_curve_e;
 };
 
 #ifdef __cplusplus
-static_assert(sizeof(ShaderInjectData) == 48);
+static_assert(sizeof(ShaderInjectData) == 80);
 static_assert(alignof(ShaderInjectData) == 16);
 #endif
 
@@ -49,6 +55,12 @@ cbuffer shader_injection : register(b13, space50) {
 #define TLOU_LUT_OFFSET            shader_injection.lut_offset
 #define TLOU_LUT_COMPRESSION       shader_injection.lut_compression
 #define TLOU_POST_LUT_AMOUNT       shader_injection.post_lut_amount
+#define TLOU_NATIVE_CURVE_ENABLED  shader_injection.native_curve_enabled
+#define TLOU_NATIVE_CURVE_A        shader_injection.native_curve_a
+#define TLOU_NATIVE_CURVE_B        shader_injection.native_curve_b
+#define TLOU_NATIVE_CURVE_C        shader_injection.native_curve_c
+#define TLOU_NATIVE_CURVE_D        shader_injection.native_curve_d
+#define TLOU_NATIVE_CURVE_E        shader_injection.native_curve_e
 
 #include "../../shaders/renodx.hlsl"
 #endif
