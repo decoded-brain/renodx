@@ -52,6 +52,10 @@ inline constexpr std::array<std::uint8_t, 32u> kExecutableSha256 = {
 };
 
 inline constexpr std::uint32_t kTemporalAaShaderCrc = 0xB5506A45u;
+// Same TAA pass, permutation Detroit uses when Resolution Scaling is below
+// 100% (renders at reduced extent, writes b16 at output extent). Identified on
+// the Epic build by comparing the compute dispatch order at 100% and 70%.
+inline constexpr std::uint32_t kTemporalAaUpscaleShaderCrc = 0x114B112Cu;
 inline constexpr std::uint32_t kObservedTemporalAaModuleSize = 37'236u;
 
 inline constexpr std::uint32_t kMotionBlurShaderCrc = 0xC03380A0u;

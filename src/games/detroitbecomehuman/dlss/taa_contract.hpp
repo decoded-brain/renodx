@@ -312,8 +312,14 @@ struct NgxFrameParameters {
       // reduced render extent.
       && constants.viewport_origin_size.z == static_cast<std::int32_t>(output_width)
       && constants.viewport_origin_size.w == static_cast<std::int32_t>(output_height);
+#ifdef DETROIT_UPSCALER_FSR
+  // The game's history weight leaves 0..1 at low render scales (about -0.12 at 33%).
+  // FSR does not use it, so only require a finite value.
+  result.history_valid = std::isfinite(constants.history);
+#else
   result.history_valid =
       constants.history >= 0.f && constants.history <= 1.f;
+#endif
   result.scale_valid =
       // The exact runtime capture keeps these two temporal tuning fields at
       // 1/1 while the real SR factor is expressed by the independently
@@ -323,8 +329,15 @@ struct NgxFrameParameters {
       && constants.upsampling > 0.f && constants.inv_upsampling > 0.f
       && NearlyEqual(
           constants.upsampling * constants.inv_upsampling, 1.f, 0.01f);
+#ifdef DETROIT_UPSCALER_FSR
+  // Only a weight in 0..0.001 means "no history"; a negative weight (low render
+  // scales) is not a reset, otherwise FSR would restart every frame.
+  const bool history_is_reset = constants.history >= 0.f && constants.history <= 0.001f;
+#else
+  const bool history_is_reset = constants.history <= 0.001f;
+#endif
   result.reset =
-      constants.history <= 0.001f
+      history_is_reset
               || constants.prev_upsampling <= 0.f
               || !NearlyEqual(constants.prev_upsampling, constants.upsampling, 0.01f)
           ? 1u

@@ -185,6 +185,29 @@ struct ModeAvailability {
          && settings.max_render_height == settings.output_height;
 }
 
+// FSR build: the game's own Resolution Scaling decides the render extent and
+// FSR upscales it to the TAA output. Accept any render extent between a third
+// of the output and the output itself.
+[[nodiscard]] constexpr bool HasUpscaleRenderRange(
+    const DetroitDlssModeSettings& settings) noexcept {
+  return settings.output_width != 0u && settings.output_height != 0u
+         && settings.min_render_width != 0u && settings.min_render_height != 0u
+         && settings.max_render_width == settings.output_width
+         && settings.max_render_height == settings.output_height
+         && settings.min_render_width <= settings.render_width
+         && settings.min_render_height <= settings.render_height
+         && settings.render_width <= settings.output_width
+         && settings.render_height <= settings.output_height;
+}
+
+[[nodiscard]] constexpr bool HasUsableModeExtent(
+    const DetroitDlssModeSettings& settings) noexcept {
+#ifdef DETROIT_UPSCALER_FSR
+  if (settings.mode != DETROIT_DLSS_MODE_NATIVE) return HasUpscaleRenderRange(settings);
+#endif
+  return HasFixedNativeExtent(settings);
+}
+
 struct FrameEligibility {
   bool evaluate_dlss = false;
   bool preserve_native_taa = true;
@@ -309,11 +332,19 @@ struct FrameEligibility {
     return {.reason = FallbackReason::kInvalidModeSettings};
   }
 
+#ifdef DETROIT_UPSCALER_FSR
+  if (inputs.render_width > inputs.output_width
+      || inputs.render_height > inputs.output_height
+      || !HasUsableModeExtent(settings)) {
+    return {.reason = FallbackReason::kInvalidModeSettings};
+  }
+#else
   if (inputs.render_width != inputs.output_width
       || inputs.render_height != inputs.output_height
       || !HasFixedNativeExtent(settings)) {
     return {.reason = FallbackReason::kInvalidModeSettings};
   }
+#endif
 
   return {
       .evaluate_dlss = true,

@@ -148,7 +148,7 @@ class TemporalResetGate {
          && settings.abi_version == DETROIT_DLSS_ABI_VERSION
          && settings.mode == mode && settings.output_width == output_width
          && settings.output_height == output_height
-         && dlss_policy::HasFixedNativeExtent(settings);
+         && dlss_policy::HasUsableModeExtent(settings);
 }
 
 class Client {
@@ -203,7 +203,7 @@ class Client {
             != DETROIT_DLSS_RESULT_SUCCESS
         || candidate.output_width != output_width
         || candidate.output_height != output_height
-        || !dlss_policy::HasFixedNativeExtent(candidate)) {
+        || !dlss_policy::HasUsableModeExtent(candidate)) {
       return false;
     }
     *settings = candidate;
@@ -476,6 +476,14 @@ class Client {
             });
       }
     }
+#ifdef DETROIT_UPSCALER_FSR
+    // The bridge publishes the accepted render range; the game's Resolution
+    // Scaling picks the actual render extent each frame.
+    if (mode != DETROIT_DLSS_MODE_NATIVE) {
+      settings.render_width = inputs.render_width;
+      settings.render_height = inputs.render_height;
+    }
+#endif
     if (diagnostics != nullptr) diagnostics->settings = settings;
 
     const auto eligibility =

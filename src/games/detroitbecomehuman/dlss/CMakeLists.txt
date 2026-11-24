@@ -78,3 +78,34 @@ if(TARGET detroitbecomehuman_rgb9e5_adapter_tests)
     detroitbecomehuman_dlss_embedded-shaders
   )
 endif()
+
+# ---------------------------------------------------------------------------
+# AMD FidelityFX Super Resolution backend (replaces NGX calls at runtime).
+# Headers live in ffx/api, ffx/upscalers; signed runtime DLLs in ffx/bin.
+# ---------------------------------------------------------------------------
+set(DETROIT_FFX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/ffx")
+if(EXISTS "${DETROIT_FFX_ROOT}/api/include/ffx_api.h")
+  option(DETROIT_UPSCALER_FSR "Build the Detroit temporal integration with AMD FSR" ON)
+else()
+  set(DETROIT_UPSCALER_FSR OFF)
+endif()
+
+if(DETROIT_UPSCALER_FSR)
+  message(STATUS "Detroit: building with the AMD FSR backend")
+  target_sources(detroitbecomehuman-effects PRIVATE
+    fsr_backend.cpp
+    fsr_backend.hpp
+  )
+  target_compile_definitions(detroitbecomehuman-effects PRIVATE DETROIT_UPSCALER_FSR=1)
+  target_include_directories(detroitbecomehuman-effects PRIVATE
+    "${DETROIT_FFX_ROOT}/api/include"
+    "${DETROIT_FFX_ROOT}/upscalers/include"
+  )
+  add_custom_target(detroitbecomehuman_fsr_runtime_copy
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${DETROIT_FFX_ROOT}/bin/amd_fidelityfx_loader_vk.dll"
+      "${DETROIT_FFX_ROOT}/bin/amd_fidelityfx_upscaler_vk.dll"
+      "$<TARGET_FILE_DIR:detroitbecomehuman-effects>"
+  )
+  add_dependencies(detroitbecomehuman-effects detroitbecomehuman_fsr_runtime_copy)
+endif()

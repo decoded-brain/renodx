@@ -149,6 +149,58 @@ inline constexpr PatchSpec<33u, 9u> kUiHalfExtentPatch = {
 static_assert(IsPatchSpecValid(kAspectGetterPatch));
 static_assert(IsPatchSpecValid(kUiHalfExtentPatch));
 
+// ---- Epic Games Store build (PE timestamp 0x64DD157E, 57,782,272 bytes). Same two
+// float loads as the Steam build, found by signature in the Epic exe; only the code
+// addresses and RIP displacements differ. ----
+inline constexpr std::uint32_t kEpicExeTimestamp = 0x64DD157Eu;
+inline constexpr std::uint32_t kEpicExeImageSize = 0x0388F000u;
+
+inline constexpr PatchSpec<21u, 8u> kEpicAspectGetterPatch = {
+    .pattern = {{{0xF3}, {0x0F}, {0x10}, {0x05}, {0x35}, {0x14}, {0xD4}, {0x01},
+                 {0xC3}, {0xF3}, {0x0F}, {0x10}, {0x05}, {0x78}, {0x14}, {0xD4},
+                 {0x01}, {0xC3}, {0xCC}, {0xCC}, {0xCC}}},
+    .instruction_offset = 9u,
+    .instruction = {0xF3, 0x0F, 0x10, 0x05, 0x78, 0x14, 0xD4, 0x01},
+    .displacement_offset = 4u,
+    .expected_pattern_file_offset = 0x15C1A3u,
+    .expected_instruction_rva = 0x15CBACu,
+    .expected_original_target_rva = 0x1E9E02Cu,
+};
+
+inline constexpr PatchSpec<33u, 9u> kEpicUiHalfExtentPatch = {
+    .pattern = {{{0x48}, {0x8B}, {0x03}, {0x48}, {0x8B}, {0xCB}, {0xFF}, {0x50},
+                 {0x10}, {0x48}, {0x8B}, {0x03}, {0x48}, {0x8B}, {0xCB}, {0xF3},
+                 {0x44}, {0x0F}, {0x10}, {0x35}, {0x57}, {0xBD}, {0x2D}, {0x01},
+                 {0x44}, {0x0F}, {0x28}, {0xC0}, {0xF3}, {0x45}, {0x0F}, {0x59},
+                 {0xC6}}},
+    .instruction_offset = 15u,
+    .instruction = {0xF3, 0x44, 0x0F, 0x10, 0x35, 0x57, 0xBD, 0x2D, 0x01},
+    .displacement_offset = 5u,
+    .expected_pattern_file_offset = 0xBC1675u,
+    .expected_instruction_rva = 0xBC2084u,
+    .expected_original_target_rva = 0x1E9DDE4u,
+};
+
+static_assert(IsPatchSpecValid(kEpicAspectGetterPatch));
+static_assert(IsPatchSpecValid(kEpicUiHalfExtentPatch));
+
+// The supported executables. The add-on picks the entry whose PE timestamp and image
+// size match the running exe, and refuses to patch anything else.
+struct BuildSpec {
+  const char* name;
+  std::uint32_t timestamp;
+  std::uint32_t image_size;
+  const PatchSpec<21u, 8u>* aspect;
+  const PatchSpec<33u, 9u>* ui;
+};
+
+inline constexpr std::array<BuildSpec, 2u> kSupportedBuilds = {{
+    {"Steam Build 12158144", kSupportedExeTimestamp, kSupportedExeImageSize,
+     &kAspectGetterPatch, &kUiHalfExtentPatch},
+    {"Epic Games Store build", kEpicExeTimestamp, kEpicExeImageSize,
+     &kEpicAspectGetterPatch, &kEpicUiHalfExtentPatch},
+}};
+
 enum class RuntimePatchId : std::uint8_t {
   kAspectGetter,
   kUiHalfExtent,

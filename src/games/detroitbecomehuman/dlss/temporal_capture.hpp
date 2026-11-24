@@ -1738,6 +1738,15 @@ inline void Use(DWORD fdw_reason) {
               .command_types =
                   renodx::utils::command_action::COMMAND_TYPE_DISPATCH,
           });
+#ifdef DETROIT_UPSCALER_FSR
+      renodx::utils::command_action::Register(
+          kTemporalDispatchCallback,
+          {
+              .shader_hash = supported_build::kTemporalAaUpscaleShaderCrc,
+              .command_types =
+                  renodx::utils::command_action::COMMAND_TYPE_DISPATCH,
+          });
+#endif
       reshade::register_event<reshade::addon_event::destroy_command_list>(
           OnDestroyTemporalCommandList);
       reshade::register_event<reshade::addon_event::reset_command_list>(

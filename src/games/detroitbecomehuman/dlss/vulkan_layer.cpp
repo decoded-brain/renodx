@@ -51,6 +51,15 @@
 #include "evaluation_trace.hpp"
 #include "feature_recording_registry.hpp"
 #include "utils/dlss/ngx_vulkan.hpp"
+#ifdef DETROIT_UPSCALER_FSR
+#include "fsr_backend.hpp"
+namespace fsr = renodx::games::detroitbecomehuman::dlss::fsr;
+
+namespace renodx::games::detroitbecomehuman::dlss {
+std::atomic<int> g_dlss_jitter_mode{3};
+std::atomic<bool> g_dlss_mv_jittered{false};
+}
+#endif
 
 namespace {
 
@@ -503,6 +512,26 @@ bool CheckSupportedHostExecutable() {
       != 0) {
     return false;
   }
+#ifdef DETROIT_UPSCALER_FSR
+  // FSR build: accept any DetroitBecomeHuman.exe (Steam or Epic). The TAA
+  // shader CRC contract still has to match before the upscaler is used.
+  {
+    WIN32_FILE_ATTRIBUTE_DATA fsr_attributes = {};
+    std::uint64_t fsr_size = 0u;
+    if (GetFileAttributesExW(executable.c_str(), GetFileExInfoStandard, &fsr_attributes) != FALSE) {
+      fsr_size = static_cast<std::uint64_t>(fsr_attributes.nFileSizeHigh) << 32u
+                 | fsr_attributes.nFileSizeLow;
+    }
+    reshade::log::message(
+        fsr_size == renodx::games::detroitbecomehuman::supported_build::kExecutableSize
+            ? reshade::log::level::info
+            : reshade::log::level::warning,
+        fsr_size == renodx::games::detroitbecomehuman::supported_build::kExecutableSize
+            ? "Detroit FSR: executable size matches the Steam reference build."
+            : "Detroit FSR: executable differs from the Steam reference build (Epic or other revision); continuing.");
+    return true;
+  }
+#endif
 
   WIN32_FILE_ATTRIBUTE_DATA attributes = {};
   if (GetFileAttributesExW(executable.c_str(), GetFileExInfoStandard, &attributes) == FALSE) {
@@ -1152,7 +1181,8 @@ std::uint32_t ToNgxCreateFlags(DetroitDlssCreateFlags flags) {
   if ((flags & DETROIT_DLSS_CREATE_DEPTH_INVERTED) != 0u) {
     ngx_flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
   }
-  if ((flags & DETROIT_DLSS_CREATE_MOTION_VECTORS_JITTERED) != 0u) {
+  if ((flags & DETROIT_DLSS_CREATE_MOTION_VECTORS_JITTERED) != 0u
+      && renodx::games::detroitbecomehuman::dlss::g_dlss_mv_jittered.load(std::memory_order_relaxed)) {
     ngx_flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
   }
   if ((flags & DETROIT_DLSS_CREATE_AUTO_EXPOSURE) != 0u) {
@@ -1316,8 +1346,30 @@ NVSDK_NGX_Result CoreCreateFeature(
   create_parameters.Feature.InHeight = config->render_height;
   create_parameters.Feature.InTargetWidth = config->output_width;
   create_parameters.Feature.InTargetHeight = config->output_height;
-  create_parameters.Feature.InPerfQualityValue = config->mode;
+  create_parameters.Feature.InPerfQualityValue =
+      (config->render_width != config->output_width || config->render_height != config->output_height)
+          ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+          : static_cast<NVSDK_NGX_PerfQuality_Value>(config->mode);
   create_parameters.InFeatureCreateFlags = static_cast<int>(config->create_flags);
+  // DLSSPreset in [renodx-preset1]: 0 = the driver's default, 1.. = preset A, B, ...
+  // The choice is applied to every quality mode. Takes effect when the feature is created.
+  {
+    float preset_choice = 0.f;
+    (void)reshade::get_config_value(nullptr, "renodx-preset1", "DLSSPreset", preset_choice);
+    constexpr unsigned kPresetValues[] = {0u, 1u, 2u, 3u, 4u, 5u, 6u, 10u, 11u, 12u, 13u};
+    const int preset_index = static_cast<int>(preset_choice + 0.5f);
+    if (parameters != nullptr && preset_index > 0
+        && preset_index < static_cast<int>(std::size(kPresetValues))) {
+      const unsigned preset = kPresetValues[preset_index];
+      for (const char* name : {"DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+                               "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+                               "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"}) {
+        NVSDK_NGX_Parameter_SetUI(parameters, name, preset);
+      }
+      reshade::log::message(reshade::log::level::info,
+                            std::format("Detroit DLSS: render preset {} requested.", preset).c_str());
+    }
+  }
   return NGX_VULKAN_CREATE_DLSS_EXT1(
       device,
       command_buffer,
@@ -1348,8 +1400,9 @@ NVSDK_NGX_Result CoreEvaluateFeature(
   evaluation.pInDepth = depth;
   evaluation.pInMotionVectors = motion_vectors;
   evaluation.pInExposureTexture = exposure;
-  evaluation.InJitterOffsetX = info->jitter_x;
-  evaluation.InJitterOffsetY = info->jitter_y;
+  const int jitter_choice = renodx::games::detroitbecomehuman::dlss::g_dlss_jitter_mode.load(std::memory_order_relaxed);
+  evaluation.InJitterOffsetX = (jitter_choice == 1 || jitter_choice == 3) ? -info->jitter_x : info->jitter_x;
+  evaluation.InJitterOffsetY = (jitter_choice == 2 || jitter_choice == 3) ? -info->jitter_y : info->jitter_y;
   evaluation.InRenderSubrectDimensions = {
       info->render_width, info->render_height};
   evaluation.InReset = info->reset;
@@ -1532,6 +1585,9 @@ bool EnsureNgxInitialized(DeviceState* state) {
 
   state->ngx_discovery = std::make_unique<NgxDiscovery>();
   state->ngx_shutdown_requested = false;
+#ifdef DETROIT_UPSCALER_FSR
+  const bool use_fsr_backend = fsr::IsActive();
+#endif
   renodx::utils::dlss::vulkan::DeviceCreateInfo create_info = {
       .instance = state->instance,
       .physical_device = state->physical_device,
@@ -1547,6 +1603,18 @@ bool EnsureNgxInitialized(DeviceState* state) {
       .sdk_version = NVSDK_NGX_Version_API,
       .ngx = {
           .context = state,
+#ifdef DETROIT_UPSCALER_FSR
+          .initialize_project = use_fsr_backend ? &fsr::InitializeProject : &CoreInitializeProject,
+          .get_capability_parameters = use_fsr_backend ? &fsr::GetCapabilityParameters : &CoreGetCapabilityParameters,
+          .get_parameter_i = use_fsr_backend ? &fsr::GetParameterI : &CoreGetParameterI,
+          .query_mode = use_fsr_backend ? &fsr::QueryMode : &CoreQueryMode,
+          .allocate_parameters = use_fsr_backend ? &fsr::AllocateParameters : &CoreAllocateParameters,
+          .destroy_parameters = use_fsr_backend ? &fsr::DestroyParameters : &CoreDestroyParameters,
+          .create_feature = use_fsr_backend ? &fsr::CreateFeature : &CoreCreateFeature,
+          .evaluate_feature = use_fsr_backend ? &fsr::EvaluateFeature : &CoreEvaluateFeature,
+          .release_feature = use_fsr_backend ? &fsr::ReleaseFeature : &CoreReleaseFeature,
+          .shutdown = use_fsr_backend ? &fsr::Shutdown : &CoreShutdown,
+#else
           .initialize_project = &CoreInitializeProject,
           .get_capability_parameters = &CoreGetCapabilityParameters,
           .get_parameter_i = &CoreGetParameterI,
@@ -1557,6 +1625,7 @@ bool EnsureNgxInitialized(DeviceState* state) {
           .evaluate_feature = &CoreEvaluateFeature,
           .release_feature = &CoreReleaseFeature,
           .shutdown = &CoreShutdown,
+#endif
       },
       .vulkan = {
           .context = state,
@@ -1755,9 +1824,22 @@ DetroitDlssResultCode DETROIT_DLSS_CALL BridgeGetContext(DetroitDlssBootstrapCon
     return DETROIT_DLSS_RESULT_FALLBACK;
   }
   const bool ngx_available = EnsureNgxInitialized(state.get());
+#ifdef DETROIT_UPSCALER_FSR
+  if (fsr::IsActive()) {
+    const std::string fsr_status = fsr::GetStatusText();
+    SetBootstrapStatus(
+        ngx_available ? BootstrapStatus::kDlaaReady : BootstrapStatus::kNativeFallback,
+        fsr_status.c_str());
+  } else {
+    SetBootstrapStatus(
+        ngx_available ? BootstrapStatus::kDlaaReady : BootstrapStatus::kNativeFallback,
+        ngx_available ? "DLSS active" : "DLSS initialization or capability check failed");
+  }
+#else
   SetBootstrapStatus(
       ngx_available ? BootstrapStatus::kDlaaReady : BootstrapStatus::kNativeFallback,
       ngx_available ? "DLAA ready" : "NGX initialization or capability check failed");
+#endif
 
   const auto struct_size = context->struct_size;
   *context = {};
@@ -2604,6 +2686,11 @@ DetroitDlssResultCode DETROIT_DLSS_CALL BridgeQueryMode(
   settings->max_render_height = output_height;
   settings->min_render_width = output_width;
   settings->min_render_height = output_height;
+#ifdef DETROIT_UPSCALER_FSR
+  // FSR upscales whatever extent the game's Resolution Scaling renders at.
+  settings->min_render_width = std::max(1u, (output_width + 2u) / 3u);
+  settings->min_render_height = std::max(1u, (output_height + 2u) / 3u);
+#endif
   TraceEvaluationMessage(std::format(
       "DLSS event=query_mode_end status=success mode={} create_flags=0x{:X} render={}x{} output={}x{}",
       static_cast<std::uint32_t>(mode),
@@ -2655,7 +2742,21 @@ DetroitDlssResultCode DETROIT_DLSS_CALL BridgeConfigure(
       && settings->min_render_height == settings->output_height
       && settings->max_render_width == settings->output_width
       && settings->max_render_height == settings->output_height;
-  if (!fixed_native_extent) {
+#ifdef DETROIT_UPSCALER_FSR
+  const bool usable_extent =
+      fixed_native_extent
+      || (settings->mode != DETROIT_DLSS_MODE_NATIVE
+          && settings->min_render_width != 0u && settings->min_render_height != 0u
+          && settings->max_render_width == settings->output_width
+          && settings->max_render_height == settings->output_height
+          && settings->min_render_width <= settings->render_width
+          && settings->min_render_height <= settings->render_height
+          && settings->render_width <= settings->output_width
+          && settings->render_height <= settings->output_height);
+#else
+  const bool usable_extent = fixed_native_extent;
+#endif
+  if (!usable_extent) {
     RetireActiveFeatureLocked(state.get());
     state->configured = false;
     return DETROIT_DLSS_RESULT_FALLBACK;
@@ -4396,7 +4497,13 @@ void RefreshDeferredStatus() {
   } else if (!state->ngx_extensions_enabled) {
     SetBootstrapStatus(BootstrapStatus::kNativeFallback, "NGX extension cache was not applied");
   } else {
+#ifdef DETROIT_UPSCALER_FSR
+    SetBootstrapStatus(
+        BootstrapStatus::kEarlyHookActive,
+        fsr::IsActive() ? "Early hook active; starting FSR" : "Early hook active; starting DLSS");
+#else
     SetBootstrapStatus(BootstrapStatus::kEarlyHookActive, "Early hook active; checking NGX");
+#endif
   }
 }
 
